@@ -1,0 +1,7 @@
+¤ Import and test code from https://github.com/tristandeleu/jax-dag-gflownet/blob/53350bbfba3ab24f9ffa8196a3de42f139d9c5cc/dag_gflownet/env.py#L12
+¤ Create agent with inputs DAGs (that will be generated with the GFLOWNet) and that uses that representation to act in the environment
+¤ Adapt environment of GFLOWNet for training in this paradigm
+¤ Figure out trainig paradigm: bootstrap RL+GLFOWNet with random action, then fine-tune RL+GFLOWnet together, online
+¤ Test on Nocture
+¤ Implement baseline regular PPO, without DAG generation
+¤ Make results 

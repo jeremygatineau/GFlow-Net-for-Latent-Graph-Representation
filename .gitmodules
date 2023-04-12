@@ -1,0 +1,3 @@
+[submodule "jax-dag-gflownet"]
+	path = jax-dag-gflownet
+	url = https://github.com/tristandeleu/jax-dag-gflownet

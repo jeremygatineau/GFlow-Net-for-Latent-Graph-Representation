@@ -5,3 +5,25 @@
 ¤ Test on Nocture
 ¤ Implement baseline regular PPO, without DAG generation
 ¤ Make results 
+
+
+-----
+
+Issue: in the way this is setup, the DAG will just match the aggregate distribution encoded through the score function, to be able to conditionalize graph generation for observations we can thus include current observation/observation window as an input to the DAG generator. 
+
+Adding backward transitions (removing nodes) would also be useful, as we could start from the last observations' DAG representation as a seed and modify it until we get a graph that matches the new distribution
+The problem with backward transitions is that they have to be done in order to not mess up the flow and create disconnected/no flowing DAGs
+How, then, do you encode what nodes *can be removed* in the action mask?
+
+
+So: 
+change the gflownet network def to include current observations as an input
+understand then change the scoring funcion to be observation-dependent
+understand then implement backwards transitions
+think through and implement training logic
+understand how the 'virtual' gflownet env connects to the true env in which the actor is acting
+find a way to represent DAGs for the actor/critic 
+maybe, in the fine-tuning phase, the GFN DAG scorer includes a term that comes from the agent's performance in the true env
+
+--> this means that understanding the scoring function is implemented so as to ground DAG generation is very important!!!!!!!!!!
+    -> do that first

@@ -27,3 +27,30 @@ maybe, in the fine-tuning phase, the GFN DAG scorer includes a term that comes f
 
 --> this means that understanding the scoring function is implemented so as to ground DAG generation is very important!!!!!!!!!!
     -> do that first
+
+
+Weird thing about the score function:
+uses local score, by assuming modularity of the reward over edges --> log(r(g)) can be expressed as a sum over local edge contribution
+if this is a model of how things ought to be, i.e. imparts a structural bias to the DAG generation then sure, but if this is rather an assumption about the reward structure itself (not how it relate to graphs) then this is more problematic
+
+
+
+---------------------------
+
+BGe score is nice but what we need is a way to represent individual observations, 
+i.e. reconstruction loss. 
+
+We could also use one good thing about GFlowNets: their ability to generate samples that are proportional to the reward R(G)
+This could allow us to generate, say, 10 graphs with the same network, based on the same information that would intrinsically
+reflect the belief distribution of *what-could-be-happening-in-the-environment*
+this would be a real advantage of GFlownets over other neural net techniqeus
+
+the issues is then to be able to generate those graphs efficiently with the added
+constraints that: graph should be determined by each observation and recursive memory
+should be taken into account: i.e. we want graph that encompass a running model of the environment state
+not just the bayesian structure of the current observation
+
+But this may require the definition of a local score, energy funciton-like estimation
+this could be acheived with a kind of critic network for which additivity constraints in enforced
+this critic would compute the marginal likelihood of the data given an incomplete graph
+it would also have a memory???

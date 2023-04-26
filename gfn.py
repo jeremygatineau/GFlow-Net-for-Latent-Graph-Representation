@@ -44,7 +44,13 @@ class TransformerBlock(nn.Module):
         x_ = self.activation(self.lin2(x_))
         x_ = self.activation(self.lin3(x_)) + x
         return x_
-    
+
+def adj_to_edge_index(adj):
+    # Convert adjacency matrix to edge index
+    # adj: (N, N)
+    # edge_index: (2, num_edges)
+    edge_index = torch.nonzero(adj, as_tuple=False).t()
+    return edge_index
 class ConditionalFlowModel(nn.Module):
     # Modified GFLowNet model for DAG generation conditioned on a given observation
     # The model takes as input an adjacency matrix of the current icomplete DAG, 
@@ -52,7 +58,7 @@ class ConditionalFlowModel(nn.Module):
     # Two heads are used: one to compute the probability to stop the sampling process,
     # and another to compute the logits of transitioning to a new graph, given that we didn't stop.
     def __init__(self, net_config):
-        super(ConditionalFlowModel).__init__()
+        super(ConditionalFlowModel, self).__init__()
         self.net_config = net_config
 
         # Edge embedding, edges are pairs of indices (source, target)
@@ -63,13 +69,18 @@ class ConditionalFlowModel(nn.Module):
         if net_config['obs_type'] == 'image':
             # Convolutional encoder
             self.obs_encoder = nn.ModuleList(
-                [nn.Conv2d(net_config['obs_channels'], net_config['obs_channels'], 3, padding=1),
+                [nn.Conv2d(net_config['obs_channels'], net_config['obs_channels'], 5, padding=2, stride=2),
                 nn.BatchNorm2d(net_config['obs_channels']),
                 nn.ReLU()]*net_config['num_conv_layers']
             )
+            final_dim = net_config['obs_size']
+            for _ in range(net_config['num_conv_layers']):
+                final_dim = int(np.ceil(final_dim / 2))
+            final_dim = final_dim**2 * net_config['obs_channels']
+
             self.obs_encoder.append(nn.Flatten())
             self.obs_encoder.append(
-                nn.Linear(net_config['obs_channels'] * net_config['obs_size']**2, 
+                nn.Linear(final_dim, 
                           net_config['embedding_dim'])
                           )
         elif net_config['obs_type'] == 'grid':
@@ -109,7 +120,7 @@ class ConditionalFlowModel(nn.Module):
             [TransformerBlock(net_config['hidden_dim'],
                                 net_config['hidden_dim'],
                                 net_config['dropout'])
-                                for _ in range(net_config['num_tb_stop_head'])]
+                                for _ in range(net_config['num_tb_stop_heads'])]
         )
         self.stop_head.append(nn.Linear(net_config['hidden_dim'], 1))
         self.stop_head.append(nn.Sigmoid())
@@ -118,19 +129,22 @@ class ConditionalFlowModel(nn.Module):
             [TransformerBlock(net_config['hidden_dim'],
                                 net_config['hidden_dim'],
                                 net_config['dropout'])
-                                for _ in range(net_config['num_tb_transition_head'])]
+                                for _ in range(net_config['num_tb_transition_heads'])]
         )
         self.transition_head.append(nn.Linear(net_config['hidden_dim'], net_config['num_variables'] **2))
         self.transition_head.append(nn.Softmax(dim=-1))
 
     def forward(self, adj, obs, mask):
         # create edges as (source, target) pairs
-        edges = torch.stack(torch.meshgrid(torch.arange(adj.shape[1]), torch.arange(adj.shape[2])), dim=-1).reshape(-1, 2)
+        edges = adj_to_edge_index(adj)
         # embed edges
         edges = self.embedding(edges)
         # embed observation
-        obs = self.obs_encoder(obs)
+        for layer in self.obs_encoder:
+            obs = layer(obs)
         # concatenate edges and observation
+        print(edges)
+        print(edges.shape, obs.shape)
         x = torch.cat([edges, obs], dim=-1)
         # apply transformer blocks
         for block in self.transformer_blocks:
@@ -196,7 +210,6 @@ class ContrastiveScorer(nn.Module):
         graph1_num_nodes = graph1_x.shape[0]
         graph2_num_nodes = graph2_x.shape[0]
         batch_size = graph_batch_1.batch.max().item() + 1
-        print("start", graph1_x.shape, graph2_x.shape)
         # encode graphs
         for layer in self.graph_encoder_gat:
             
@@ -214,14 +227,10 @@ class ContrastiveScorer(nn.Module):
                 # have to change view to include batch dimension
                 graph1_x = layer(graph1_x)
                 graph2_x = layer(graph2_x)
-            print('passed layer', layer.__class__.__name__, graph1_x.shape, graph2_x.shape)
         # concatenate embeddings while preserving batch dimension
-        print(graph1_x.shape, graph2_x.shape)
         x = torch.cat([graph1_x, graph2_x], dim=-1)
-        print(x.shape)
         # apply contrastive head
         for layer in self.contrastive_head:
             x = layer(x)
-            print('passed layer', layer.__class__.__name__, x.shape)
 
         return x

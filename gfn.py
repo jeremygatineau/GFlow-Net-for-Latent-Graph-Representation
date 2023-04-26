@@ -281,6 +281,6 @@ class GraphGenerator(nn.module):
             # initailize graph
             graph_adj = torch.zeros(obs.shape[0], self.net_config['num_variables'], self.net_config['num_variables'])
             mask = get_mask(graph_adj)
-            , logits = self.gflow(graph_adj, obs, mask)
+            _, logits = self.gflow(graph_adj, obs, mask)
             
             

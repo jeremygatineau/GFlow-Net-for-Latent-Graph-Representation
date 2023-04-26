@@ -5,6 +5,8 @@ from torch.distributions.categorical import Categorical
 from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_add_pool, global_max_pool
 import torch.nn.functional as F
 import numpy as np
+
+from util import get_mask
 class HydraAttention(nn.Module):
     # implemented from https://arxiv.org/pdf/2209.07484.pdf
     def __init__(self, embedding_dim, output_layer='linear', dropout=0.0):
@@ -44,11 +46,11 @@ class TransformerBlock(nn.Module):
         return x_
     
 class ConditionalFlowModel(nn.Module):
-# Modified GFLowNet model for DAG generation conditioned on a given observation
-# The model takes as input an adjacency matrix of the current icomplete DAG, 
-# the current observation and a mask for the valid actions.
-# Two heads are used: one to compute the probability to stop the sampling process,
-# and another to compute the logits of transitioning to a new graph, given that we didn't stop.
+    # Modified GFLowNet model for DAG generation conditioned on a given observation
+    # The model takes as input an adjacency matrix of the current icomplete DAG, 
+    # the current observation and a mask for the valid actions.
+    # Two heads are used: one to compute the probability to stop the sampling process,
+    # and another to compute the logits of transitioning to a new graph, given that we didn't stop.
     def __init__(self, net_config):
         super(ConditionalFlowModel).__init__()
         self.net_config = net_config
@@ -119,7 +121,7 @@ class ConditionalFlowModel(nn.Module):
                                 net_config['dropout'])
                                 for _ in range(net_config['num_tb_transition_head'])]
         )
-        self.transition_head.append(nn.Linear(net_config['hidden_dim'], net_config['num_variables'] * (net_config['num_variables'] - 1)))
+        self.transition_head.append(nn.Linear(net_config['hidden_dim'], net_config['num_variables'] **2))
         self.transition_head.append(nn.Softmax(dim=-1))
 
     def forward(self, adj, obs, mask):
@@ -146,6 +148,8 @@ class ConditionalFlowModel(nn.Module):
         logits_x = logits_x.reshape(-1, adj.shape[1], adj.shape[2])
         # apply mask
         logits_x = logits_x * mask
+        # normalize probabilities
+        logits_x = logits_x / logits_x.sum(dim=[1,2], keepdim=True)
         return stop_x, logits_x
     
 class GAT(torch.nn.Module):
@@ -209,7 +213,7 @@ class GraphScorer(nn.Module):
             adj_i[:, i, :] = 0
             adj_i[:, :, i] = 0
             rec_loss_i = true_loss_fun(adj_i, device)
-            delta_i = F.mse_loss(rec_loss.detach(), rec_loss_i)
+            delta_i = F.mse_loss(rec_loss_i.detach(), x)
             score_loss += delta_i
         
         score_loss += F.mse_loss(global_score, rec_loss.detach())
@@ -245,20 +249,38 @@ class GraphGenerator(nn.module):
                 [nn.Linear(net_config['graph_embedding_dim_sq'], 1)]
             )
 
-    def train_step_value_model(self, episodes, mode, optim, device):
-        graph = self.gflow(...)
-        graph_embedding = self.graph_encoding(graph)
+    def train_step_value_model(self, graph_adj, obs, mode, optim, device):
+        # Makes one traininng step for the value model (reconstruction of observation or reward from latent graph)
+        graph_embedding = self.graph_encoding(graph_adj.to(device))
         if mode == 'rec':
-            obs_rec = self.value_model(graph_embedding)
-            rec_loss = F.mse_loss(episodes["obs"], obs_rec)
+            obs_rec = self.value_model(graph_embedding.to(device))
+            rec_loss = F.mse_loss(obs, obs_rec)
             rec_loss.backward()
             optim.step()
             optim.zero_grad()
 
         elif mode == 'reward':
-            pred_reward = self.value_model(graph_embedding)
-            critic_loss = F.mse_loss(episodes["reward"], pred_reward)
-            critic_loss.backward()
+            raise NotImplementedError
+        
+    def train_step_scorer(self, graph_adj, val, mode, optim, device):
+        # Makes one training step for the scorer (predicts score-contribution of nodes in the graph)
+        if mode == 'rec':
+            loss = self.scorer.loss_rec(graph_adj, 
+                                        true_loss_fun=
+                                            lambda graph_adj: F.mse_loss(self.value_model(self.graph_encoding(graph_adj)), val), 
+                                        device=device)
+            loss.backward()
             optim.step()
             optim.zero_grad()
-         
+        
+    def train_step_gflow(self, obs, scorer_fun, optim, device):
+        # Makes one training step for the gflow (learns to generate latent graphs)
+        
+        # generate a graph representing the observation
+        for step in range(self.net_config['max_nodes']):
+            # initailize graph
+            graph_adj = torch.zeros(obs.shape[0], self.net_config['num_variables'], self.net_config['num_variables'])
+            mask = get_mask(graph_adj)
+            , logits = self.gflow(graph_adj, obs, mask)
+            
+            

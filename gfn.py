@@ -156,131 +156,48 @@ class GAT(torch.nn.Module):
     # Graph attention block
     def __init__(self, in_dim, out_dim, hid, in_head, out_head, dropout):
         super(GAT, self).__init__()
+        self.in_head = in_head
+        self.out_head = out_head
+        self.hid = hid
         self.dropout = dropout
         self.conv1 = GATConv(in_dim, self.hid, heads=self.in_head, dropout=dropout)
         self.conv2 = GATConv(self.hid*self.in_head, out_dim, concat=False,
                              heads=self.out_head, dropout=dropout)
-def forward(self,x, edge_index):
-        # x: node feature matrix of shape [num_nodes, in_channels]
-        # edge_index: graph connectivity in COO format with shape [2, num_edges]
+    def forward(self,x, edge_index):
+        # x: node feature matrix of shape [batch_size, num_nodes, in_channels]
+        # edge_index: graph connectivity in COO format with shape [batch_size, 2, num_edges]
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.conv1(x, edge_index)
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.conv2(x, edge_index)
         return x,F.log_softmax(x, dim=1)
-class GraphScorer(nn.Module):
-    # Learns to score partial DAGs based on either the reconstruction accuracy or the reward associated with using the DAG by the actor
+
+class ContrastiveScorer(nn.Module):
+    # Learns to score pairs of graphs, whether they represent the same episode or not
     def __init__(self, net_config):
-        super(GraphScorer, self).__init__()
+        super(ContrastiveScorer, self).__init__()
         self.net_config = net_config
-        # local scorer to predict the score associated with a node in the DAG given its parents
-        self.local_scorer = nn.ModuleList(
-            [TransformerBlock(2*net_config['embedding_dim'],
-                                net_config['hidden_dim'],
-                                net_config['dropout'])
-                                for _ in range(net_config['num_tb_local_scorer'])]
+        # Graph encoder with Graph Attention Transformer
+        self.graph_encoder = nn.ModuleList(
+            [GAT(net_config['num_node_features'], net_config['hidden_dim'], net_config['hidden_dim'], net_config['num_heads'], net_config['num_heads'], net_config['dropout']),
+            nn.LeakyReLU()]*net_config['num_gat_layers'] + [nn.Flatten(), nn.Linear(net_config['hidden_dim']*net_config['num_heads'], net_config['graph_embedding_dim'])]
         )
-        
-        # Embedding layer for the nodes
-        self.embedding = nn.Embedding(net_config['num_variables'], net_config['embedding_dim'])
-        
-    def loss_rec(self, adj, true_loss_fun, device='cpu'):
-        # Adj: adjacency matrix of shape [batch_size, num_variables, num_variables]
-        # true_loss_fun: function that computes the value loss (critic/reconstruction) given an adjacency matrix
-        # device: 'cpu' or cuda device
-        # Loop thorugh the nodes and compute the score
-        # reconstruction loss with full graph
-        rec_loss = true_loss_fun(adj, device)
-        score_loss = 0
-        global_score = 0
-        for i in range(adj.shape[1]):
-            # get parents
-            parents = adj[:, i, :].nonzero()
-            # get node embedding
-            node_embedding = self.embedding(torch.tensor([i]).to(device))
-            # get parent embeddings
-            parent_embeddings = self.embedding(parents[:, 1]).to(device)
-            # concatenate node embedding and parent embeddings
-            x = torch.cat([node_embedding, parent_embeddings], dim=-1)
-            # apply transformer blocks
-            for block in self.local_scorer:
-                x = block(x)
-            # get score
-            global_score += x
-            # reconstruction loss without node i
-            adj_i = adj.clone()
-            adj_i[:, i, :] = 0
-            adj_i[:, :, i] = 0
-            rec_loss_i = true_loss_fun(adj_i, device)
-            delta_i = F.mse_loss(rec_loss_i.detach(), x)
-            score_loss += delta_i
-        
-        score_loss += F.mse_loss(global_score, rec_loss.detach())
-        
-        return score_loss
-
-class GraphGenerator(nn.module):
-    # Learns to generate DAGs conditioned on observation
-    def __init__(self, net_config, mode='rec'):
-        self.net_config = net_config
-        self.mode = mode
-        
-        self.gflow = ConditionalFlowModel(net_config)
-        self.scorer = GraphScorer(net_config)
-        
-        # Graph attention for embedding, finish at net_config['graph_embedding_dim_sq']
-        self.graph_encoding = nn.ModuleList(
-            [GAT(net_config['embedding_dim'], net_config['graph_embedding_dim_sq'], net_config['hidden_dim'], 1, net_config['num_heads'], net_config['dropout'])] +
-            [GAT(net_config['graph_embedding_dim_sq'], net_config['graph_embedding_dim_sq'], net_config['hidden_dim'], net_config['num_heads'], net_config['num_heads'], net_config['dropout']) for _ in range(net_config['num_gat']-1)]
-            [nn.Flatten(), nn.Linear(net_config['graph_embedding_dim_sq']*net_config['num_heads'], net_config['graph_embedding_dim_sq'])]
+        self.contrastive_head = nn.ModuleList(
+            [nn.Linear(2*net_config['graph_embedding_dim'], net_config['graph_embedding_dim']),
+            nn.ReLU()] * net_config['num_contrastive_layers'] + [nn.Linear(net_config['graph_embedding_dim'], 1), nn.Sigmoid()]
         )
-        if mode == 'rec':
-            # latent graph rec to reconstructed observation by succesivly bigger convolutions, until obs_size reached
-            # enough deconvolutions to get back to obs_size from graph_embedding_dim_sq
-            self.value_model = nn.ModuleList(
-                    [nn.ConvTranspose2d(1, 1, 3, stride=2, padding=1, output_padding=1)]*int(np.log2(net_config['obs_size'])-np.log2(net_config['graph_embedding_dim_sq'])) +
-                    [nn.Conv2d(1, 1, 3, padding=1)]
-            )
-        elif mode == 'reward':
-            # latent graph rec to reward
-            self.value_model = nn.ModuleList(
-                [nn.Linear(net_config['graph_embedding_dim_sq'], net_config['graph_embedding_dim_sq']) for _ in range(net_config['num_critic'])] +
-                [nn.Linear(net_config['graph_embedding_dim_sq'], 1)]
-            )
-
-    def train_step_value_model(self, graph_adj, obs, mode, optim, device):
-        # Makes one traininng step for the value model (reconstruction of observation or reward from latent graph)
-        graph_embedding = self.graph_encoding(graph_adj.to(device))
-        if mode == 'rec':
-            obs_rec = self.value_model(graph_embedding.to(device))
-            rec_loss = F.mse_loss(obs, obs_rec)
-            rec_loss.backward()
-            optim.step()
-            optim.zero_grad()
-
-        elif mode == 'reward':
-            raise NotImplementedError
+    def forward(self, graph1, graph1_edge_indices, graph2, graph2_edge_indices):
+        # graph1 and graph2 are of shape [batch_size, num_nodes, num_node_features]
+        # graph1_edge_indices and graph2_edge_indices are of shape [batch_size, 2, num_edges] (in COO format)
         
-    def train_step_scorer(self, graph_adj, val, mode, optim, device):
-        # Makes one training step for the scorer (predicts score-contribution of nodes in the graph)
-        if mode == 'rec':
-            loss = self.scorer.loss_rec(graph_adj, 
-                                        true_loss_fun=
-                                            lambda graph_adj: F.mse_loss(self.value_model(self.graph_encoding(graph_adj)), val), 
-                                        device=device)
-            loss.backward()
-            optim.step()
-            optim.zero_grad()
-        
-    def train_step_gflow(self, obs, scorer_fun, optim, device):
-        # Makes one training step for the gflow (learns to generate latent graphs)
-        
-        # generate a graph representing the observation
-        for step in range(self.net_config['max_nodes']):
-            # initailize graph
-            graph_adj = torch.zeros(obs.shape[0], self.net_config['num_variables'], self.net_config['num_variables'])
-            mask = get_mask(graph_adj)
-            _, logits = self.gflow(graph_adj, obs, mask)
-            
-            
+        # encode graphs
+        for layer in self.graph_encoder:
+            graph1 = layer(graph1, graph1_edge_indices)
+            graph2 = layer(graph2, graph2_edge_indices)
+        # concatenate embeddings
+        x = torch.cat([graph1, graph2], dim=-1)
+        # apply contrastive head
+        for layer in self.contrastive_head:
+            x = layer(x)
+        return x

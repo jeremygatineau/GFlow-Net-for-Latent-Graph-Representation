@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 
-from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_add_pool, global_max_pool
+from torch_geometric.nn import GATConv, GPSConv, GINEConv, global_mean_pool
 import torch.nn.functional as F
 import numpy as np
 
@@ -96,7 +96,6 @@ class ConditionalFlowModel(nn.Module):
             raise ValueError('Invalid observation type')
 
 
-
         # Common transformer blocks
         self.transformer_blocks = nn.ModuleList(
             [TransformerBlock(2*net_config['embedding_dim'], 
@@ -181,34 +180,48 @@ class ContrastiveScorer(nn.Module):
         # Graph encoder with Graph Attention Transformer
         self.graph_encoder_gat = nn.ModuleList(
             [GAT(net_config['num_node_features'], net_config['hidden_dim'], net_config['hidden_dim'], net_config['num_heads'], net_config['num_heads'], net_config['dropout']),
-            nn.LeakyReLU()]
+            nn.LeakyReLU(inplace=True)]
             + [GAT(net_config['hidden_dim'], net_config['hidden_dim'], net_config['hidden_dim'], net_config['num_heads'], net_config['num_heads'], net_config['dropout']),
-            nn.LeakyReLU()]*net_config['num_gat_layers'] +
+            nn.LeakyReLU(inplace=True)]*net_config['num_gat_layers'] +
             [nn.Flatten(), nn.Linear(net_config['hidden_dim'], net_config['graph_embedding_dim'])]
         )
         self.contrastive_head = nn.ModuleList(
-            [nn.Linear(2*net_config['graph_embedding_dim'], net_config['graph_embedding_dim']),
-            nn.ReLU()] * net_config['num_contrastive_layers'] + [nn.Linear(net_config['graph_embedding_dim'], 1), nn.Sigmoid()]
+            [nn.Linear(2*net_config['graph_embedding_dim'], 2*net_config['graph_embedding_dim']),
+            nn.ReLU()] * net_config['num_contrastive_layers'] + [nn.Linear(2*net_config['graph_embedding_dim'], 1), nn.Sigmoid()]
         )
     def forward(self, graph_batch_1, graph_batch_2):
         # graph_batch are torch_geometric.data.Batch objects
         graph1_x = graph_batch_1.x
         graph2_x = graph_batch_2.x
+        graph1_num_nodes = graph1_x.shape[0]
+        graph2_num_nodes = graph2_x.shape[0]
+        batch_size = graph_batch_1.batch.max().item() + 1
         print("start", graph1_x.shape, graph2_x.shape)
         # encode graphs
         for layer in self.graph_encoder_gat:
+            
             if isinstance(layer, GAT):
-                graph1_x = layer(graph1_x, graph_batch_1.edge_index)
-                graph2_x = layer(graph2_x, graph_batch_2.edge_index)
-            else:
+                graph1_x = layer(graph1_x.view(graph1_num_nodes, -1), graph_batch_1.edge_index)
+                graph2_x = layer(graph2_x.view(graph2_num_nodes, -1), graph_batch_2.edge_index)
+            elif isinstance(layer, nn.Flatten):
+                # aggregate node embeddings with mean pooling before flattening
+                graph1_x = global_mean_pool(graph1_x.view(graph1_num_nodes, -1), graph_batch_1.batch)
+                graph2_x = global_mean_pool(graph2_x.view(graph2_num_nodes, -1), graph_batch_2.batch)
+
                 graph1_x = layer(graph1_x)
                 graph2_x = layer(graph2_x)
-        # concatenate embeddings
+            else:
+                # have to change view to include batch dimension
+                graph1_x = layer(graph1_x)
+                graph2_x = layer(graph2_x)
+            print('passed layer', layer.__class__.__name__, graph1_x.shape, graph2_x.shape)
+        # concatenate embeddings while preserving batch dimension
         print(graph1_x.shape, graph2_x.shape)
-        print(graph_batch_1.edge_index.shape, graph_batch_2.edge_index.shape)
         x = torch.cat([graph1_x, graph2_x], dim=-1)
         print(x.shape)
         # apply contrastive head
         for layer in self.contrastive_head:
             x = layer(x)
+            print('passed layer', layer.__class__.__name__, x.shape)
+
         return x

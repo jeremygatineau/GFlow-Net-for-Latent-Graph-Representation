@@ -171,7 +171,7 @@ class GAT(torch.nn.Module):
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.conv2(x, edge_index)
-        return x,F.log_softmax(x, dim=1)
+        return x
 
 class ContrastiveScorer(nn.Module):
     # Learns to score pairs of graphs, whether they represent the same episode or not
@@ -179,24 +179,35 @@ class ContrastiveScorer(nn.Module):
         super(ContrastiveScorer, self).__init__()
         self.net_config = net_config
         # Graph encoder with Graph Attention Transformer
-        self.graph_encoder = nn.ModuleList(
+        self.graph_encoder_gat = nn.ModuleList(
             [GAT(net_config['num_node_features'], net_config['hidden_dim'], net_config['hidden_dim'], net_config['num_heads'], net_config['num_heads'], net_config['dropout']),
-            nn.LeakyReLU()]*net_config['num_gat_layers'] + [nn.Flatten(), nn.Linear(net_config['hidden_dim']*net_config['num_heads'], net_config['graph_embedding_dim'])]
+            nn.LeakyReLU()]
+            + [GAT(net_config['hidden_dim'], net_config['hidden_dim'], net_config['hidden_dim'], net_config['num_heads'], net_config['num_heads'], net_config['dropout']),
+            nn.LeakyReLU()]*net_config['num_gat_layers'] +
+            [nn.Flatten(), nn.Linear(net_config['hidden_dim'], net_config['graph_embedding_dim'])]
         )
         self.contrastive_head = nn.ModuleList(
             [nn.Linear(2*net_config['graph_embedding_dim'], net_config['graph_embedding_dim']),
             nn.ReLU()] * net_config['num_contrastive_layers'] + [nn.Linear(net_config['graph_embedding_dim'], 1), nn.Sigmoid()]
         )
-    def forward(self, graph1, graph1_edge_indices, graph2, graph2_edge_indices):
-        # graph1 and graph2 are of shape [batch_size, num_nodes, num_node_features]
-        # graph1_edge_indices and graph2_edge_indices are of shape [batch_size, 2, num_edges] (in COO format)
-        
+    def forward(self, graph_batch_1, graph_batch_2):
+        # graph_batch are torch_geometric.data.Batch objects
+        graph1_x = graph_batch_1.x
+        graph2_x = graph_batch_2.x
+        print("start", graph1_x.shape, graph2_x.shape)
         # encode graphs
-        for layer in self.graph_encoder:
-            graph1 = layer(graph1, graph1_edge_indices)
-            graph2 = layer(graph2, graph2_edge_indices)
+        for layer in self.graph_encoder_gat:
+            if isinstance(layer, GAT):
+                graph1_x = layer(graph1_x, graph_batch_1.edge_index)
+                graph2_x = layer(graph2_x, graph_batch_2.edge_index)
+            else:
+                graph1_x = layer(graph1_x)
+                graph2_x = layer(graph2_x)
         # concatenate embeddings
-        x = torch.cat([graph1, graph2], dim=-1)
+        print(graph1_x.shape, graph2_x.shape)
+        print(graph_batch_1.edge_index.shape, graph_batch_2.edge_index.shape)
+        x = torch.cat([graph1_x, graph2_x], dim=-1)
+        print(x.shape)
         # apply contrastive head
         for layer in self.contrastive_head:
             x = layer(x)

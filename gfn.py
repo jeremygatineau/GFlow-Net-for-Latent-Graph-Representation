@@ -45,12 +45,7 @@ class TransformerBlock(nn.Module):
         x_ = self.activation(self.lin3(x_)) + x
         return x_
 
-def adj_to_edge_index(adj):
-    # Convert adjacency matrix to edge index
-    # adj: (N, N)
-    # edge_index: (2, num_edges)
-    edge_index = torch.nonzero(adj, as_tuple=False).t()
-    return edge_index
+
 class ConditionalFlowModel(nn.Module):
     # Modified GFLowNet model for DAG generation conditioned on a given observation
     # The model takes as input an adjacency matrix of the current icomplete DAG, 
@@ -62,7 +57,7 @@ class ConditionalFlowModel(nn.Module):
         self.net_config = net_config
 
         # Edge embedding, edges are pairs of indices (source, target)
-        self.embedding = nn.Embedding(2 * net_config['num_variables'], net_config['embedding_dim']) 
+        self.embedding = nn.Embedding(2 * net_config['num_variables'], net_config['node_embedding_dim']) 
         self.embedding.weight.data.uniform_(-1, 1)
 
         # Observation encoder, depends on observation type (image, grid tensor or tuple)
@@ -135,15 +130,25 @@ class ConditionalFlowModel(nn.Module):
         self.transition_head.append(nn.Softmax(dim=-1))
 
     def forward(self, adj, obs, mask):
-        # create edges as (source, target) pairs
-        edges = adj_to_edge_index(adj)
+        """
+        adj: (B, max_nodes, max_nodes)
+        obs: (B, obs_channels, obs_size, obs_size)
+        mask: (B, max_nodes, max_nodes)
+        """
+        # create edges as pairs of indices (source, target)
+        ind = np.arange(adj.shape[0]**2)
+        src, tgt = np.divmod(ind, adj.shape[0])
+        edges = torch.stack([torch.from_numpy(src), torch.from_numpy(tgt)], dim=-1)
+
         # embed edges
         edges = self.embedding(edges)
+        # repeat edge embedding to match batch size
+        edges = edges.repeat(adj.shape[0], 1, 1)
         # embed observation
         for layer in self.obs_encoder:
             obs = layer(obs)
         # concatenate edges and observation
-        print(edges)
+        print("edges", edges)
         print(edges.shape, obs.shape)
         x = torch.cat([edges, obs], dim=-1)
         # apply transformer blocks

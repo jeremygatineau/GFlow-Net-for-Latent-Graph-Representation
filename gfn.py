@@ -166,7 +166,6 @@ class ConditionalFlowModel(nn.Module):
                                 for _ in range(net_config['num_tb_stop_heads'])]
         )
         self.stop_head.append(nn.Linear(net_config['embedding_dim'], 1))
-        self.stop_head.append(nn.Sigmoid())
 
         self.transition_head = nn.ModuleList(
             [TransformerBlock(input_dim=net_config['embedding_dim'],
@@ -205,13 +204,10 @@ class ConditionalFlowModel(nn.Module):
         
         # embed the edge sequence with transformer blocks
         for tb in self.transformer_blocks:
-            print(edge_embeddings.shape, tb)
             edge_embeddings = tb(edge_embeddings, obs_embedding, mask=None)
         # transition probabilities, one value per element in the edge sequence
-        print(edge_embeddings.shape)
         for ix, layer in enumerate(self.transition_head):
-            print(ix)
-            transition_ = layer(edge_embeddings, obs_embedding, mask=None)
+            transition_ = layer(edge_embeddings)
         transition_= transition_.squeeze(-1)  # (B, max_nodes*max_nodes)
         # set bad transition probabilities to 0 
         transition_ = transition_.masked_fill(mask.view(adj.shape[0], -1) == 0, -1e9)
@@ -219,11 +215,9 @@ class ConditionalFlowModel(nn.Module):
         transition_probs = F.softmax(transition_, dim=-1).view(adj.shape[0], adj.shape[1], adj.shape[2])  # (B, max_nodes, max_nodes)
         # stop probability, aggregate at the last layer of the stop head
         for ix, layer in enumerate(self.stop_head):
-            if ix == len(self.stop_head) -2:
-                break
-            stop_ = layer(edge_embeddings, obs_embedding, mask=None)
-        stop_ = stop_.mean(dim=1)  # (B, 1)
-        stop_prob = self.stop_head[-1](stop_)  # sigmoid
+            stop_ = layer(edge_embeddings)
+        stop_ = stop_.sum(dim=1)  # (B, 1)
+        stop_prob = F.sigmoid(stop_)  # (B, 1)
         return transition_probs, stop_prob
 
 

@@ -1,0 +1,66 @@
+seed: 0
+device: cuda:0
+debug: false
+experiment: intersection
+env: contrastive_env
+wandb: false
+wandb_project: nocturne4
+wandb_id: null
+wandb_group: ${experiment}
+number_of_episodes: 10
+max_pairs_per_episode: 5
+single_agent_mode: true
+episode_length: 80
+num_files: -1
+scenario_path: ${oc.env:PROCESSED_TRAIN_NO_TL}
+dt: 0.1
+sims_per_step: 10
+img_as_state: false
+discretize_actions: true
+accel_discretization: 6
+accel_lower_bound: -3
+accel_upper_bound: 2
+steering_lower_bound: -0.7
+steering_upper_bound: 0.7
+steering_discretization: 21
+head_angle_lower_bound: -1.6
+head_angle_upper_bound: 1.6
+head_angle_discretization: 5
+max_num_vehicles: 20
+randomize_goals: false
+scenario:
+  start_time: 0
+  allow_non_vehicles: false
+  moving_threshold: 0.2
+  speed_threshold: 0.05
+  max_visible_objects: 16
+  max_visible_road_points: 1000
+  max_visible_traffic_lights: 20
+  max_visible_stop_signs: 4
+  sample_every_n: 1
+  road_edge_first: false
+remove_at_goal: true
+remove_at_collide: true
+rew_cfg:
+  shared_reward: false
+  goal_tolerance: 0.5
+  reward_scaling: 10.0
+  collision_penalty: 0
+  shaped_goal_distance_scaling: 0.2
+  shaped_goal_distance: true
+  goal_distance_penalty: false
+  goal_achieved_bonus: ${episode_length}
+  position_target: true
+  position_target_tolerance: 1.0
+  speed_target: true
+  speed_target_tolerance: 1.0
+  heading_target: true
+  heading_target_tolerance: 0.3
+subscriber:
+  view_angle: 2.1
+  view_dist: 80
+  use_ego_state: true
+  use_observations: true
+  keep_inactive_agents: false
+  n_frames_stacked: 1
+results_dir: ${oc.env:NOCTURNE_LOG_DIR}

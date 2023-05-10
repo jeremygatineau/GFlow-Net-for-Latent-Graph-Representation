@@ -1,6 +1,7 @@
 defaults:
   - override hydra/launcher: submitit_local
 
+dataset: contrastive_dataset_10_80.pkl
 experiment: test
 path: ${oc.env:PROCESSED_TRAIN_NO_TL}
 num_files: 1000

@@ -93,11 +93,13 @@ rew_cfg:
   heading_target: True
   heading_target_tolerance: 0.3
 subscriber:
+  img_height: 100
+  img_width: 100
   view_angle: 2.1
   # the distance which the cone extends before agents are not visible
   # TODO(eugenevinitsky) pick the right number
   view_dist: 80
-  use_ego_state: True
+  use_ego_state: False
   use_observations: True
   # if true, we return an observation for agents that have exited the system
   # as well as returning an observation for the extra agents if the number of

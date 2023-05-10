@@ -50,8 +50,18 @@ def generate_contrastive_dataset(cfg):
             action = env.action_space.sample()
             state, reward, done, info = env.step({})
             all_vhc_ids = list(state.keys())
-            obs = env.get_observation(env.controlled_vehicles[0])
-            
+            obs = env.scenario.getConeImage(
+                env.controlled_vehicles[0],
+                # how far the agent can see
+                view_dist=cfg['subscriber']['view_dist'],
+                # the angle formed by the view cone
+                view_angle=cfg['subscriber']['view_angle'],
+                # the agent's head angle
+                head_angle=0.0,
+                # whether to draw the goal position in the image
+                img_height=cfg['subscriber']['img_height'],
+                img_width=cfg['subscriber']['img_width'],
+                draw_target_position=False)
             observations.append(obs)
             if done["__all__"] == True:
                 break
@@ -107,13 +117,16 @@ class Dataset(torch.utils.data.Dataset):
   def __getitem__(self, index):
         'Generates one sample of data'
         # Select sample
-        obs1, obs2 = self.dataset[index][0]
-        label = self.dataset[index][1]
+        obs1, obs2, label = self.dataset[index]
+        # reshape images to (H, W, C)
+        # convert images to RGB (saved as RGBA)
+        obs1 = obs1[:,:,:3]
+        obs2 = obs2[:,:,:3]
 
         return obs1, obs2, label
 
 @hydra.main(config_path="/home/jeremy/Documents/GitHub/GFlow-Net-for-Latent-Graph-Representation/", config_name="train_config")
-def _main(args):
+def main(args):
     """Train contrastive gflownet graph generation model."""
 
     set_seed_everywhere(args.seed)
@@ -131,42 +144,12 @@ def _main(args):
         mean_scalings = [3, 0.7]
         std_devs = [0.1, 0.02]
 
-    dataloader_cfg = {
-        'tmin': 0,
-        'tmax': 90,
-        'view_dist': args.view_dist,
-        'view_angle': args.view_angle,
-        'dt': 0.1,
-        'expert_action_bounds': expert_bounds,
-        'expert_position': args.actions_are_positions,
-        'state_normalization': 100,
-        'n_stacked_states': args.n_stacked_states,
-    }
-    scenario_cfg = {
-        'start_time': 0,
-        'allow_non_vehicles': True,
-        'spawn_invalid_objects': True,
-        'max_visible_road_points': args.max_visible_road_points,
-        'sample_every_n': 1,
-        'road_edge_first': False,
-    }
-    dataset = WaymoDataset(
-        data_path=args.path,
-        file_limit=args.num_files,
-        dataloader_config=dataloader_cfg,
-        scenario_config=scenario_cfg,
-    )
-    data_loader = iter(
-        DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            num_workers=args.n_cpus,
-            pin_memory=True,
-        ))
-
+    dataset = Dataset("data" + args.dataset_name)
+    data_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
     # create model
-    sample_state, _ = next(data_loader)
-    n_states = sample_state.shape[-1]
+    o1_, _, _ = next(data_loader)
+    img_shape = o1_.shape[1:]
 
     net_config = {
         'num_node_features': 5,
@@ -207,8 +190,6 @@ def _main(args):
     # save configs
     configs_path = exp_dir / 'configs.json'
     configs = {
-        'scenario_cfg': scenario_cfg,
-        'dataloader_cfg': dataloader_cfg,
         'gfn_config': net_config_gfn,
         'scorer_config': net_config,
     }
@@ -221,14 +202,14 @@ def _main(args):
         writer = SummaryWriter(log_dir=str(exp_dir))
     # wandb logging
     if args.wandb:
-        wandb_mode = "online"
+        wandb_mode = "disabled" if DEBUG else "online"
         wandb.init(config=args,
                 project=args.wandb_project,
                 name=args.experiment,
                 group=args.experiment,
                 resume="allow",
                 settings=wandb.Settings(start_method="fork"),
-                mode=wandb_mode if not DEBUG else "disabled")
+                mode=wandb_mode)
 
     # train loop
     print('Exp dir created at', exp_dir)
@@ -242,15 +223,96 @@ def _main(args):
                       unit='batch'): 
             
             # get states and expert actions
-            states, expert_actions = next(data_loader)
-            print(states.shape, states.dtype)
-            print(np.sqrt(states.shape[1]))
-            print(expert_actions.shape, expert_actions.dtype)
-            print(states)
+            obs1, obs2, labels = next(data_loader)
             
-            states = states.to(args.device)
-            expert_actions = expert_actions.to(args.device)
-            1+" " # --------------------------------------------------- STOP 
+            obs1 = obs1.to(args.device)
+            obs2 = obs2.to(args.device)
+            labels = labels.to(args.device)
+            # initialize adjacency matrices at 0
+            adj = torch.zeros((2*args.batch_size, net_config_gfn['max_nodes'], net_config_gfn['max_nodes']))
+            # initialize noded embeddings at 0
+            node_embeddings = torch.zeros(2*args.batch_size, net_config_gfn['max_nodes'], net_config_gfn['node_embedding_dim'])
+            
+            # reshape observations to be B x C x N x N
+            obs1 = obs1.permute(0, 3, 1, 2)
+            obs2 = obs2.permute(0, 3, 1, 2)
+
+            # generate args.K graphs for each batch element by repeating batch elements K times and then reassambling their corresponding graphs
+            obs1 = obs1.repeat(args.K, 1, 1, 1)
+            obs2 = obs2.repeat(args.K, 1, 1, 1)
+            adj = adj.repeat(args.K, 1, 1)
+            node_embeddings = node_embeddings.repeat(args.K, 1, 1)
+            # concatenate observations at the batch level to get 2*B*K x C x N x N to be faster
+            obs = torch.cat((obs1, obs2), dim=0)
+            # generate graphs until done flag is set to 1 for all batch elements
+            done = torch.zeros(2*args.batch_size * args.K)
+            step = 0
+            # initialize last state's forward transition probability, flow and 
+            last_fwd_transition_probs = torch.ones(2*args.batch_size * args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
+            last_flow = torch.zeros(2*args.batch_size * args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
+
+            while not done.all():
+                
+
+               
+                bck_transition_probs, fwd_transition_probs, stop_prob, flow, node_embeddings_ = gflownet(adj, node_embeddings, obs, get_mask(adj[0]))
+                # transition_probs is 2*B*K x n_nodes x n_nodes
+                fwd_transition_probs = fwd_transition_probs.reshape(2*args.batch_size*args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
+                bck_transition_probs = bck_transition_probs.reshape(2*args.batch_size*args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
+                # stop_prob is 2*B*K x 1
+                # node_embeddings is 2*B*K x n_nodes x node_embedding_dim
+                # see if we should stop
+                stop = torch.bernoulli(stop_prob)
+                # stop is 2*B*K x 1
+                if stop.sum() > 0:
+                    # if we should stop, set done flag to 1 for all batch elements that should stop
+                    done[stop.nonzero(as_tuple=True)[0]] = 1
+                
+                # for all batch elements that should not stop, sample the transition according to the forward transition probability
+                # this is done by sampling a categorical distribution with the transition probabilities as logits
+                # the sampled transition is then used to update the adjacency matrix
+
+                # get the indices of the batch elements that should not stop
+                not_stop_idx = (1 - done).nonzero(as_tuple=True)[0]
+                # sample the transition probabilities
+                sampled_transitions = torch.multinomial(fwd_transition_probs[not_stop_idx], 1)
+                # update the adjacency matrix
+                adj[not_stop_idx] = adj[not_stop_idx].scatter_(1, sampled_transitions, 1)
+                # update the node embeddings
+                node_embeddings[not_stop_idx] = node_embeddings_[not_stop_idx]
+
+                # compute the contrastive loss
+                # we need to recover the K graphs representing the same observation for each batch element 
+                # to get graph adjacency matrices of shape B x K x N x N, 
+                # node embeddings of shape B x K x N x node_embedding_dim 
+                # we first reshape the adjacency matrix to be 2*B x K x N x N
+                adj = adj.reshape(2*args.batch_size, args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
+                # we then split the adjacency matrix along the batch dimension to get two adjacency matrices of shape B x K x N x N
+                adj1, adj2 = torch.split(adj, args.batch_size, dim=0)
+                # we do the same for the node embeddings
+                node_embeddings = node_embeddings.reshape(2*args.batch_size, args.K, net_config_gfn['max_nodes'], net_config_gfn['node_embedding_dim'])
+                node_embeddings1, node_embeddings2 = torch.split(node_embeddings, args.batch_size, dim=0)
+                # we then compute the contrastive loss
+
+
+                contrastive_loss = _compute_contrastive_loss(adj1, adj2, node_embeddings1, node_embeddings2, labels, args.device)
+
+                if step == 0:
+                    step += 1
+                    last_fwd_transition_probs = fwd_transition_probs
+                    last_flow = flow
+                    last_contrastive_loss = 0
+                    continue
+                step += 1
+
+                # now we compute the loss as (log F(s) + log Pf(s'|s) - log F(s') - log Pb(s|s') + E(s-->s') )^2
+
+
+
+
+
+
+
             # compute loss
             if args.discrete:
                 log_prob, expert_idxs = model.log_prob(states,
@@ -359,8 +421,8 @@ def _main(args):
 
 
 if __name__ == '__main__':
-    #main()
-
+    main()
+    """
     # generate dataset, parameters in env_config are episode_len = 80, n_episodes = 1000
     import os
     if not os.path.exists("data/contrastive_dataset_80_1000.pkl"):
@@ -376,5 +438,6 @@ if __name__ == '__main__':
     )
     for i, x in zip(range(100), data_loader):
         print(i, x[0].shape, x[1].shape, x[2].shape)
+    """
 
     

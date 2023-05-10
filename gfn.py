@@ -30,8 +30,8 @@ class HydraAttention(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, embedding_dim, num_heads, out_dim, output_layer='linear', dropout=0.0):
         super(MultiHeadAttention, self).__init__()
-        self.attentions = nn.ModuleList([HydraAttention(embedding_dim, output_layer, dropout) for _ in range(num_heads)])
-        self.out = nn.Linear(embedding_dim * num_heads, embedding_dim) if output_layer == 'linear' else nn.Identity()
+        self.attentions = nn.ModuleList([HydraAttention(embedding_dim, out_dim, output_layer, dropout) for _ in range(num_heads)])
+        self.out = nn.Linear(out_dim * num_heads, out_dim) if output_layer == 'linear' else nn.Identity()
         
     def forward(self, x, mask=None):
         return self.out(torch.cat([attn(x, mask) for attn in self.attentions], dim=-1))
@@ -46,7 +46,7 @@ class TransformerBlock(nn.Module):
             self.residual_proj = nn.Identity()
         self.lin1 = nn.Linear(input_dim, embedding_dim)
         self.lin2 = nn.Linear(embedding_dim, embedding_dim)
-        self.lin3 = nn.Linear(embedding_dim, embedding_dim)
+        self.lin3 = nn.Linear(out_dim, out_dim)
         self.activation = nn.GELU()
         self.norm1 = nn.LayerNorm(embedding_dim)
         self.attention = MultiHeadAttention(embedding_dim, num_heads, out_dim, output_layer, dropout)
@@ -60,15 +60,17 @@ class TransformerBlock(nn.Module):
         # apply the layers to each edge in the sequence
         
         # mix the input with the mix vector (repeated to match shape)
+        
         if self.residual:
             res = self.residual_proj(x)
         if mix is not None:
             x = self.mix_layer(torch.cat([x, mix.unsqueeze(1).repeat(1, x.shape[1], 1)], dim=-1))
+        
         x = self.activation(self.lin1(x))
         x = self.norm1(x)
         x = self.activation(self.lin2(x))
-        x = self.norm2(x)
         x = self.attention(x, mask)
+        x = self.norm2(x)
         x = self.activation(self.lin3(x))
         if self.residual:
             x = x + res
@@ -140,7 +142,7 @@ class ConditionalFlowModel(nn.Module):
         layers = []
         for i in range(net_config['num_transformer_blocks']):
             if i == 0:
-                input_dim = 2*net_config['embedding_dim']
+                input_dim = 2*net_config['node_embedding_dim']
             else:
                 input_dim = net_config['embedding_dim']
             layers.append(TransformerBlock(input_dim=input_dim,
@@ -167,7 +169,7 @@ class ConditionalFlowModel(nn.Module):
         )
         self.stop_head.append(nn.Linear(net_config['embedding_dim'], 1))
 
-        self.transition_head = nn.ModuleList(
+        self.fwd_transition_head = nn.ModuleList(
             [TransformerBlock(input_dim=net_config['embedding_dim'],
                                 embedding_dim=net_config['embedding_dim'],
                                 num_heads=net_config['num_heads'],
@@ -178,22 +180,57 @@ class ConditionalFlowModel(nn.Module):
                                 residual=True)
                                 for _ in range(net_config['num_tb_transition_heads'])]
         )
-        self.transition_head.append(nn.Linear(net_config['embedding_dim'], 1))
+        self.fwd_transition_head.append(nn.Linear(net_config['embedding_dim'], 1))
+        self.bck_transition_head = nn.ModuleList(
+            [TransformerBlock(input_dim=net_config['embedding_dim'],
+                                embedding_dim=net_config['embedding_dim'],
+                                num_heads=net_config['num_heads'],
+                                out_dim=net_config['embedding_dim'],
+                                mix_dim=None,
+                                output_layer='linear',
+                                dropout=net_config['dropout'],
+                                residual=True)
+                                for _ in range(net_config['num_tb_transition_heads'])]
+        )
+        self.bck_transition_head.append(nn.Linear(net_config['embedding_dim'], 1))
+        self.flow_head = nn.ModuleList(
+            [TransformerBlock(input_dim=net_config['embedding_dim'],
+                                embedding_dim=net_config['embedding_dim'],
+                                num_heads=net_config['num_heads'],
+                                out_dim=net_config['embedding_dim'],
+                                mix_dim=None,
+                                output_layer='linear',
+                                dropout=net_config['dropout'],
+                                residual=False)
+                                for _ in range(net_config['num_flow_heads'])])
+        self.flow_head.append(nn.Linear(net_config['embedding_dim'], 1))
 
+        self.node_embedding_head = nn.ModuleList(
+            [TransformerBlock(input_dim=net_config['embedding_dim'],
+                                embedding_dim=net_config['embedding_dim'],
+                                num_heads=net_config['num_heads'],
+                                out_dim=net_config['node_embedding_dim'],
+                                mix_dim=None,
+                                output_layer='linear',
+                                dropout=net_config['dropout'],
+                                residual=True)
+                                for _ in range(net_config['num_tb_transition_heads'])]
+        )
     def forward(self, adj, node_embeddings, obs, mask):
         """
         adj: (B, max_nodes, max_nodes)
-        node_embeddings: (B, max_nodes, embedding_dim), 0 for non-nodes
+        node_embeddings: (B, max_nodes, node_embedding_dim), 0 for non-nodes
         obs: (B, obs_channels, obs_size, obs_size)
         mask: (B, max_nodes, max_nodes)
         retunrs: stop_logits (B, 1), transition_logits (B, max_nodes, max_nodes) of toggling an edge
         """
         
         # create sequence of edges as pairs of node embeddings (source, target), whith 0 for non-edges
+        
         edge_embeddings = torch.cat([node_embeddings.unsqueeze(2).repeat(1, 1, self.net_config['max_nodes'], 1),
                                     node_embeddings.unsqueeze(1).repeat(1, self.net_config['max_nodes'], 1, 1)], 
                                     dim=-1)
-        edge_embeddings = edge_embeddings.view(adj.shape[0], -1, 2*self.net_config['embedding_dim'])  # (B, max_nodes*max_nodes, 2*embedding_dim)
+        edge_embeddings = edge_embeddings.view(adj.shape[0], -1, 2*node_embeddings.shape[2] )  # (B, max_nodes*max_nodes, 2*node_embedding_dim)
         # set non-edges to 0
         edge_embeddings = edge_embeddings * adj.view(adj.shape[0], -1, 1)
         # embed observation
@@ -205,20 +242,40 @@ class ConditionalFlowModel(nn.Module):
         # embed the edge sequence with transformer blocks
         for tb in self.transformer_blocks:
             edge_embeddings = tb(edge_embeddings, obs_embedding, mask=None)
-        # transition probabilities, one value per element in the edge sequence
-        for ix, layer in enumerate(self.transition_head):
-            transition_ = layer(edge_embeddings)
-        transition_= transition_.squeeze(-1)  # (B, max_nodes*max_nodes)
+        # forward transition probabilities, one value per element in the edge sequence
+        for ix, layer in enumerate(self.fwd_transition_head):
+            fwd_transition_ = layer(edge_embeddings)
+        fwd_transition_= fwd_transition_.squeeze(-1)  # (B, max_nodes*max_nodes)
         # set bad transition probabilities to 0 
-        transition_ = transition_.masked_fill(mask.view(adj.shape[0], -1) == 0, -1e9)
+        fwd_transition_ = fwd_transition_.masked_fill(mask.view(adj.shape[0], -1) == 0, -1e9)
         # softmax over the edge sequence
-        transition_probs = F.softmax(transition_, dim=-1).view(adj.shape[0], adj.shape[1], adj.shape[2])  # (B, max_nodes, max_nodes)
+        fwd_transition_probs = F.softmax(fwd_transition_, dim=-1).view(adj.shape[0], adj.shape[1], adj.shape[2])  # (B, max_nodes, max_nodes)
+
+        # same for backward transition probabilities
+        for ix, layer in enumerate(self.bck_transition_head):
+            bck_transition_ = layer(edge_embeddings)
+        bck_transition_= bck_transition_.squeeze(-1)  # (B, max_nodes*max_nodes)
+        bck_transition_probs = F.softmax(bck_transition_, dim=-1).view(adj.shape[0], adj.shape[1], adj.shape[2])  # (B, max_nodes, max_nodes)
+
         # stop probability, aggregate at the last layer of the stop head
         for ix, layer in enumerate(self.stop_head):
             stop_ = layer(edge_embeddings)
         stop_ = stop_.sum(dim=1)  # (B, 1)
         stop_prob = F.sigmoid(stop_)  # (B, 1)
-        return transition_probs, stop_prob
+        # same for flow
+        for ix, layer in enumerate(self.flow_head):
+            flow_ = layer(edge_embeddings)
+        flow = flow_.mean(dim=1)  # (B, 1)
+
+        # get new node embeddings
+        for ix, layer in enumerate(self.node_embedding_head):
+            node_embeddings = layer(edge_embeddings)
+        # aggregate over the edge sequence from their appearance in the source positions and the target positions in edge embeddings
+        node_embeddings = node_embeddings.view(adj.shape[0], adj.shape[1], adj.shape[2], -1).sum(dim=2)  # (B, max_nodes, node_embedding_dim)
+        # mask nodes that are not in the graph (as they are not in the adjacency matrix)
+        not_adj_mask = (adj.sum(dim=-1) == 0).unsqueeze(-1).repeat(1, 1, node_embeddings.shape[-1])
+        node_embeddings = node_embeddings.masked_fill(not_adj_mask, 0)
+        return bck_transition_probs, fwd_transition_probs, stop_prob, flow, node_embeddings
 
 
 class GAT(torch.nn.Module):

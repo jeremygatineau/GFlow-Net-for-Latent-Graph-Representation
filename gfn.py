@@ -5,7 +5,7 @@ from torch.distributions.categorical import Categorical
 from torch_geometric.nn import GATConv, GPSConv, GINEConv, global_mean_pool
 import torch.nn.functional as F
 import numpy as np
-
+from torch_geometric.data import Data, Batch
 from util import get_mask
 class HydraAttention(nn.Module):
     # implemented from https://arxiv.org/pdf/2209.07484.pdf
@@ -313,11 +313,12 @@ class ContrastiveScorer(nn.Module):
             [nn.Flatten(), nn.Linear(net_config['hidden_dim'], net_config['graph_embedding_dim'])]
         )
         self.contrastive_head = nn.ModuleList(
-            [nn.Linear(2*net_config['graph_embedding_dim'], 2*net_config['graph_embedding_dim']),
+            [nn.Linear(2*net_config['num_graph_per_obs']*net_config['graph_embedding_dim'], 2*net_config['graph_embedding_dim']),
             nn.ReLU()] * net_config['num_contrastive_layers'] + [nn.Linear(2*net_config['graph_embedding_dim'], 1), nn.Sigmoid()]
         )
     def forward(self, graph_batch_1, graph_batch_2):
-        # graph_batch are torch_geometric.data.Batch objects
+        # graphs_batch is a list of are torch_geometric.data.Batch objects of length  true_batch_size*num_graph_per_obs
+        
         graph1_x = graph_batch_1.x
         graph2_x = graph_batch_2.x
         graph1_num_nodes = graph1_x.shape[0]
@@ -340,10 +341,43 @@ class ContrastiveScorer(nn.Module):
                 # have to change view to include batch dimension
                 graph1_x = layer(graph1_x)
                 graph2_x = layer(graph2_x)
-        # concatenate embeddings while preserving batch dimension
-        x = torch.cat([graph1_x, graph2_x], dim=-1)
+        # reshape to [batch_size, num_graph_per_obs*graph_embedding_dim]
+        graph1_x = graph1_x.view(batch_size, -1)
+        # concatenate graphs embeddings
+        x = torch.cat([graph1_x, graph2_x], dim=-1) # [batch_size, 2*num_graph_per_obs*graph_embedding_dim]
         # apply contrastive head
         for layer in self.contrastive_head:
             x = layer(x)
 
         return x
+    
+    def _contrastive_loss(self, adj1, adj2, nd_ebd1, nd_ebd2, labels, device):
+        # computes the contrastive loss for batch of graphs sequences 
+        # adj1, adj2: lists of adjacency matrices of shape [batch_size, K, max_nodes, max_nodes], each K matrix is a graph representing the same observation
+        # nd_ebd1, nd_ebd2: lists of node embeddings of shape [batch_size, K, max_nodes, node_embedding_dim]
+        # labels: list of labels of shape [batch_size, 1] that indicate whether a graph sequence in adj1 and adj2 represent the same observation
+        # device: torch.device object
+        batch_size = adj1.shape[0]
+        K = adj1.shape[1]
+        # reshape to [batch_size*K, max_nodes, max_nodes]
+        adj1 = adj1.view(batch_size*K, adj1.shape[2], adj1.shape[3]).to(device)
+        adj2 = adj2.view(batch_size*K, adj2.shape[2], adj2.shape[3]).to(device)
+        # reshape to [batch_size*K, max_nodes, node_embedding_dim]
+        nd_ebd1 = nd_ebd1.view(batch_size*K, nd_ebd1.shape[2], nd_ebd1.shape[3]).to(device)
+        nd_ebd2 = nd_ebd2.view(batch_size*K, nd_ebd2.shape[2], nd_ebd2.shape[3]).to(device)
+        # create torch_geometric.data.Batch objects
+        graph_batch_1 = []
+        graph_batch_2 = []
+        for i in range(batch_size):
+            for k in range(K):
+                graph_batch_1.append(Data(x=nd_ebd1[i, k], edge_index=adj1[i, k].nonzero().t(), device=device))
+                graph_batch_2.append(Data(x=nd_ebd2[i, k], edge_index=adj2[i, k].nonzero().t(), device=device))
+        graph_batch_1 = Batch.from_data_list(graph_batch_1, device=device)
+        graph_batch_2 = Batch.from_data_list(graph_batch_2, device=device)
+
+        # compute contrastive loss
+        scores = self.forward(graph_batch_1, graph_batch_2)
+        labels = labels.view(-1)
+
+        loss = F.binary_cross_entropy(scores.view(-1), labels, reduction='none')
+        return loss

@@ -8,7 +8,8 @@ from pathlib import Path
 import pickle
 import random
 import json
-
+import os
+import networkx as nx
 import hydra
 import numpy as np
 import torch
@@ -21,7 +22,7 @@ import wandb
 from gfn import ConditionalFlowModel, ContrastiveScorer
 
 from nocturne.envs.wrappers import create_env
-
+from util import get_mask
 DEBUG = True
 def set_seed_everywhere(seed):
     """Ensure determinism."""
@@ -146,7 +147,24 @@ def main(args):
 
     dataset = Dataset("data" + args.dataset_name)
     data_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
+    def gradient_clipping_and_metrics(model, metrics_dict_, prefix):
+        # grad clipping
+        total_norm = 0
+        for p in scorer.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().data.norm(2)
+                total_norm += param_norm.item()**2
+        total_norm = total_norm**0.5
+        metrics_dict_['train/' + prefix + 'grad_norm'] = total_norm
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        total_norm = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().data.norm(2)
+                total_norm += param_norm.item()**2
+        total_norm = total_norm**0.5
+        metrics_dict_['train/' + prefix + 'grad_norm'] = total_norm
+        return metrics_dict_
     # create model
     o1_, _, _ = next(data_loader)
     img_shape = o1_.shape[1:]
@@ -250,11 +268,11 @@ def main(args):
             # initialize last state's forward transition probability, flow and 
             last_fwd_transition_probs = torch.ones(2*args.batch_size * args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
             last_flow = torch.zeros(2*args.batch_size * args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
-
+            
             while not done.all():
                 
 
-               
+                
                 bck_transition_probs, fwd_transition_probs, stop_prob, flow, node_embeddings_ = gflownet(adj, node_embeddings, obs, get_mask(adj[0]))
                 # transition_probs is 2*B*K x n_nodes x n_nodes
                 fwd_transition_probs = fwd_transition_probs.reshape(2*args.batch_size*args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
@@ -295,124 +313,73 @@ def main(args):
                 # we then compute the contrastive loss
 
 
-                contrastive_loss = _compute_contrastive_loss(adj1, adj2, node_embeddings1, node_embeddings2, labels, args.device)
+                contrastive_loss = scorer._contrastive_loss(adj1, adj2, node_embeddings1, node_embeddings2, labels, args.device) # no reduction
+                # perform optimization step for the scorer
+                optimizer_scorer.zero_grad()
+                r_contrastive_loss = contrastive_loss.mean()
+                r_contrastive_loss.backward()
+                metrics_dict = {}
+                gradient_clipping_and_metrics(scorer, metrics_dict, 'scorer_')
+                metrics_dict['train/scorer_loss'] = r_contrastive_loss.item()
+                optimizer_scorer.step()
 
                 if step == 0:
                     step += 1
                     last_fwd_transition_probs = fwd_transition_probs
                     last_flow = flow
-                    last_contrastive_loss = 0
+                    last_contrastive_loss = contrastive_loss
                     continue
                 step += 1
 
-                # now we compute the loss as (log F(s) + log Pf(s'|s) - log F(s') - log Pb(s|s') + E(s-->s') )^2
-
-
-
-
-
-
-
-            # compute loss
-            if args.discrete:
-                log_prob, expert_idxs = model.log_prob(states,
-                                                       expert_actions,
-                                                       return_indexes=True)
-            else:
-                dist = model.dist(states)
-                log_prob = dist.log_prob(expert_actions.float())
-            loss = -log_prob.mean()
-
-            metrics_dict = {}
-
-            # optim step
-            optimizer.zero_grad()
-            loss.backward()
-
-            # grad clipping
-            total_norm = 0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    total_norm += param_norm.item()**2
-            total_norm = total_norm**0.5
-            metrics_dict['train/grad_norm'] = total_norm
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            total_norm = 0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    total_norm += param_norm.item()**2
-            total_norm = total_norm**0.5
-            metrics_dict['train/post_clip_grad_norm'] = total_norm
-            optimizer.step()
-
-            # tensorboard logging
-            metrics_dict['train/loss'] = loss.item()
-
-            if args.actions_are_positions:
-                metrics_dict['train/x_logprob'] = log_prob[0]
-                metrics_dict['train/y_logprob'] = log_prob[1]
-                metrics_dict['train/steer_logprob'] = log_prob[2]
-            else:
-                metrics_dict['train/accel_logprob'] = log_prob[0]
-                metrics_dict['train/steer_logprob'] = log_prob[1]
-
-            if not model_cfg['discrete']:
-                diff_actions = torch.mean(torch.abs(dist.mean -
-                                                    expert_actions),
-                                          axis=0)
-                metrics_dict['train/accel_diff'] = diff_actions[0]
-                metrics_dict['train/steer_diff'] = diff_actions[1]
-                metrics_dict['train/l2_dist'] = torch.norm(
-                    dist.mean - expert_actions.float())
-
-            if model_cfg['discrete']:
-                with torch.no_grad():
-                    model_actions, model_idxs = model(states,
-                                                      deterministic=True,
-                                                      return_indexes=True)
-                accuracy = [
-                    (model_idx == expert_idx).float().mean(axis=0)
-                    for model_idx, expert_idx in zip(model_idxs, expert_idxs.T)
-                ]
-                if args.actions_are_positions:
-                    metrics_dict['train/x_pos_acc'] = accuracy[0]
-                    metrics_dict['train/y_pos_acc'] = accuracy[1]
-                    metrics_dict['train/heading_acc'] = accuracy[2]
+                # now we compute the gfn loss as (log F(s) + log Pf(s'|s) - log F(s') - log Pb(s|s') + E(s-->s') )^2
+                # where F(s) is the flow computed by the gfn, Pf(s'|s) is the forward transition probability
+                # Pb(s|s') is the backward transition probability and E(s-->s') is the difference in energy between the two states
+                # energy here is just the difference in contrastive loss between the two states
+                dE = contrastive_loss - last_contrastive_loss # B, 1
+                if args.log_flow:
+                    gfn_loss = (last_flow + torch.log(last_fwd_transition_probs) - flow - torch.log(bck_transition_probs) + dE)**2
                 else:
-                    metrics_dict['train/accel_acc'] = accuracy[0]
-                    metrics_dict['train/steer_acc'] = accuracy[1]
+                    gfn_loss = (torch.log(last_flow) + torch.log(last_fwd_transition_probs) - torch.log(flow) - torch.log(bck_transition_probs) + dE)**2
+                gfn_loss = gfn_loss.mean()
+                optimizer_gflownet.zero_grad()
+                gfn_loss.backward()
+                gradient_clipping_and_metrics(gflownet, metrics_dict, 'gflownet_')
+                metrics_dict['train/gflownet_loss'] = gfn_loss.item()
+                optimizer_gflownet.step()            
 
             for key, val in metrics_dict.items():
                 if args.write_to_tensorboard:
                     writer.add_scalar(key, val, n_samples)
             if args.wandb:
                 wandb.log(metrics_dict, step=n_samples)
+                # every 10 epochs, log a vizualization of observations and their corresponding graphs
+                if epoch % 10 == 0:
+                    # log the first observation
+                    obs = obs[0]
+                    obs = obs.cpu().numpy().transpose(1, 2, 0)
+                    # map to [0, 1]
+                    obs = (obs - obs.min()) / (obs.max() - obs.min())
+                    obs = obs * 255
+                    obs = obs.astype(np.uint8)
+                    wandb.log({'observation': wandb.Image(obs)}, step=n_samples)
+                    # log the corresponding graph
+                    adj = adj[0].cpu().numpy()
+                    graph = nx.from_numpy_matrix(adj)
+                    A = nx.nx_agraph.to_agraph(graph)
+                    A.layout('dot')
+                    A.draw('graph.png')
+                    wandb.log({'graph': wandb.Image('graph.png')}, step=n_samples)
+                    os.remove('graph.png')
+
+
+
         # save model checkpoint
         if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
             model_path = exp_dir / f'model_{epoch+1}.pth'
-            torch.save(model, str(model_path))
+            torch.save(scorer, str(model_path)+'.scorer')
+            torch.save(gflownet, str(model_path) + '.gfn')
             pickle.dump(filter, open(exp_dir / f"filter_{epoch+1}.pth", "wb"))
             print(f'\nSaved model at {model_path}')
-        if args.discrete:
-            if args.actions_are_positions:
-                print('xpos')
-                print('model: ', model_idxs[0][0:10])
-                print('expert: ', expert_idxs[0:10, 0])
-                print('ypos')
-                print('model: ', model_idxs[1][0:10])
-                print('expert: ', expert_idxs[0:10, 1])
-                print('steer')
-                print('model: ', model_idxs[2][0:10])
-                print('expert: ', expert_idxs[0:10, 2])
-            else:
-                print('accel')
-                print('model: ', model_idxs[0][0:10])
-                print('expert: ', expert_idxs[0:10, 0])
-                print('steer')
-                print('model: ', model_idxs[1][0:10])
-                print('expert: ', expert_idxs[0:10, 1])
 
     print('Done, exp dir is', exp_dir)
 

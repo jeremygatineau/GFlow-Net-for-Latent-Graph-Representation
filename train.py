@@ -19,10 +19,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 
-from gfn import ConditionalFlowModel, ContrastiveScorer
+from gfn import ContrastGFN
 
 from nocturne.envs.wrappers import create_env
-from util import get_mask
+from util import get_mask, ContrastiveDataset
 DEBUG = True
 def set_seed_everywhere(seed):
     """Ensure determinism."""
@@ -32,7 +32,10 @@ def set_seed_everywhere(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-
+def force_cudnn_initialization():
+    s = 32
+    dev = torch.device('cuda')
+    torch.nn.functional.conv2d(torch.zeros(s, s, s, s, device=dev), torch.zeros(s, s, s, s, device=dev))
 
 
 @hydra.main(config_path="/home/jeremy/Documents/GitHub/GFlow-Net-for-Latent-Graph-Representation/", config_name="env_config")
@@ -104,32 +107,13 @@ def generate_contrastive_dataset(cfg):
         print(f"Saved dataset to {f.name}")
 
 
-class Dataset(torch.utils.data.Dataset):
-  'Contrastive dataset of pairs of observations with labels 0 if they are from the same episode and 1 if they are from different episodes'
-  def __init__(self, file_name):
-        'Initialization'
-        with open(file_name, "rb") as f:
-            self.dataset = pickle.load(f)
 
-  def __len__(self):
-        'Denotes the total number of samples'
-        return len(self.dataset)
-
-  def __getitem__(self, index):
-        'Generates one sample of data'
-        # Select sample
-        obs1, obs2, label = self.dataset[index]
-        # reshape images to (H, W, C)
-        # convert images to RGB (saved as RGBA)
-        obs1 = obs1[:,:,:3]
-        obs2 = obs2[:,:,:3]
-
-        return obs1, obs2, label
 
 @hydra.main(config_path="/home/jeremy/Documents/GitHub/GFlow-Net-for-Latent-Graph-Representation/", config_name="train_config")
 def main(args):
     """Train contrastive gflownet graph generation model."""
-
+    
+    #force_cudnn_initialization()
     set_seed_everywhere(args.seed)
     # create dataset and dataloader
     if args.actions_are_positions:
@@ -144,13 +128,18 @@ def main(args):
         actions_discretizations = [15, 43]
         mean_scalings = [3, 0.7]
         std_devs = [0.1, 0.02]
-
-    dataset = Dataset("data" + args.dataset_name)
-    data_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    print("Loading dataset")
+    dataset = ContrastiveDataset("../../../../../../data/" + args.dataset_name) # current dir for the dataset fct is deep in checkpoints dir
+    data_loader = iter(torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    ))
     def gradient_clipping_and_metrics(model, metrics_dict_, prefix):
         # grad clipping
-        total_norm = 0
-        for p in scorer.parameters():
+        total_norm = 0  
+        for p in model.parameters():
             if p.grad is not None:
                 param_norm = p.grad.detach().data.norm(2)
                 total_norm += param_norm.item()**2
@@ -165,40 +154,47 @@ def main(args):
         total_norm = total_norm**0.5
         metrics_dict_['train/' + prefix + 'grad_norm'] = total_norm
         return metrics_dict_
-    # create model
-    o1_, _, _ = next(data_loader)
-    img_shape = o1_.shape[1:]
+    
 
     net_config = {
         'num_node_features': 5,
-        'hidden_dim': 7,
+        'embedding_dim': 10,
         'num_heads': 2,
         'dropout': 0.1,
-        'num_gat_layers': 2,
+        'num_transformer_blocks': 2,
         'graph_embedding_dim': 10,
         'num_contrastive_layers': 2,
+        'batch_size': args.batch_size,
+        'num_graph_per_obs': args.K,
+        'node_embedding_dim': 10,
+        'max_nodes': 20,
     }
     net_config_gfn = {
         'obs_type': 'image',
         'obs_channels': 3,
         'num_conv_layers': 5,
-        'obs_size': 200,
-        'max_nodes': 4,
+        'obs_size': 100,
+        'max_nodes': 20,
         'embedding_dim': 10,
+        'node_embedding_dim': 10,
         'dropout': 0.1,
-        'num_heads': 2,
+        'num_heads': 4,
         'num_transformer_blocks': 4,
         'num_tb_stop_heads': 4,
         'num_tb_transition_heads': 4,
-        'num_variables' : 10
+        'num_flow_layers':4,
+        'num_variables' : 10,
+        'batch_size': args.batch_size,
+        'num_graph_per_obs': args.K,
+        'height': 100,
+        'width': 100,
+        'log_flow': args.log_flow,
     }
-
-    scorer = ContrastiveScorer(net_config).to(args.device).train()
-    gflownet = ConditionalFlowModel(net_config_gfn).to(args.device).train()
+    MAX_STEPS = 10
+    contrastGFN = ContrastGFN(net_config, net_config_gfn, device=args.device)
     
     # create optimizer
-    optimizer_scorer = Adam(scorer.parameters(), lr=args.lr)
-    optimizer_gflownet = Adam(gflownet.parameters(), lr=args.lr)
+    optimizer= Adam(contrastGFN.parameters(), lr=args.lr)
 
     # create exp dir
     time_str = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -232,6 +228,7 @@ def main(args):
     # train loop
     print('Exp dir created at', exp_dir)
     print(f'`tensorboard --logdir={exp_dir}`\n')
+    torch.autograd.set_detect_anomaly(True)
     for epoch in range(args.epochs):
         print(f'\nepoch {epoch+1}/{args.epochs}')
         n_samples = epoch * args.batch_size * (args.samples_per_epoch //
@@ -242,111 +239,63 @@ def main(args):
             
             # get states and expert actions
             obs1, obs2, labels = next(data_loader)
-            
-            obs1 = obs1.to(args.device)
-            obs2 = obs2.to(args.device)
-            labels = labels.to(args.device)
+
+            obs1 = obs1.to(args.device).float()
+            obs2 = obs2.to(args.device).float()
+            labels = labels.to(args.device).float()
             # initialize adjacency matrices at 0
-            adj = torch.zeros((2*args.batch_size, net_config_gfn['max_nodes'], net_config_gfn['max_nodes']))
+            adj = torch.zeros((2*args.batch_size, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])).float()
+            
             # initialize noded embeddings at 0
-            node_embeddings = torch.zeros(2*args.batch_size, net_config_gfn['max_nodes'], net_config_gfn['node_embedding_dim'])
+            node_embeddings = torch.zeros(2*args.batch_size, net_config_gfn['max_nodes'], net_config_gfn['node_embedding_dim']).float()
             
             # reshape observations to be B x C x N x N
             obs1 = obs1.permute(0, 3, 1, 2)
             obs2 = obs2.permute(0, 3, 1, 2)
 
             # generate args.K graphs for each batch element by repeating batch elements K times and then reassambling their corresponding graphs
+            
             obs1 = obs1.repeat(args.K, 1, 1, 1)
             obs2 = obs2.repeat(args.K, 1, 1, 1)
+            
             adj = adj.repeat(args.K, 1, 1)
             node_embeddings = node_embeddings.repeat(args.K, 1, 1)
             # concatenate observations at the batch level to get 2*B*K x C x N x N to be faster
             obs = torch.cat((obs1, obs2), dim=0)
+            
             # generate graphs until done flag is set to 1 for all batch elements
             done = torch.zeros(2*args.batch_size * args.K)
             step = 0
             # initialize last state's forward transition probability, flow and 
             last_fwd_transition_probs = torch.ones(2*args.batch_size * args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
             last_flow = torch.zeros(2*args.batch_size * args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
-            
+            step = 0
             while not done.all():
-                
 
-                
-                bck_transition_probs, fwd_transition_probs, stop_prob, flow, node_embeddings_ = gflownet(adj, node_embeddings, obs, get_mask(adj[0]))
-                # transition_probs is 2*B*K x n_nodes x n_nodes
-                fwd_transition_probs = fwd_transition_probs.reshape(2*args.batch_size*args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
-                bck_transition_probs = bck_transition_probs.reshape(2*args.batch_size*args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
-                # stop_prob is 2*B*K x 1
-                # node_embeddings is 2*B*K x n_nodes x node_embedding_dim
-                # see if we should stop
-                stop = torch.bernoulli(stop_prob)
-                # stop is 2*B*K x 1
-                if stop.sum() > 0:
-                    # if we should stop, set done flag to 1 for all batch elements that should stop
-                    done[stop.nonzero(as_tuple=True)[0]] = 1
-                
-                # for all batch elements that should not stop, sample the transition according to the forward transition probability
-                # this is done by sampling a categorical distribution with the transition probabilities as logits
-                # the sampled transition is then used to update the adjacency matrix
-
-                # get the indices of the batch elements that should not stop
-                not_stop_idx = (1 - done).nonzero(as_tuple=True)[0]
-                # sample the transition probabilities
-                sampled_transitions = torch.multinomial(fwd_transition_probs[not_stop_idx], 1)
-                # update the adjacency matrix
-                adj[not_stop_idx] = adj[not_stop_idx].scatter_(1, sampled_transitions, 1)
-                # update the node embeddings
-                node_embeddings[not_stop_idx] = node_embeddings_[not_stop_idx]
-
-                # compute the contrastive loss
-                # we need to recover the K graphs representing the same observation for each batch element 
-                # to get graph adjacency matrices of shape B x K x N x N, 
-                # node embeddings of shape B x K x N x node_embedding_dim 
-                # we first reshape the adjacency matrix to be 2*B x K x N x N
-                adj = adj.reshape(2*args.batch_size, args.K, net_config_gfn['max_nodes'], net_config_gfn['max_nodes'])
-                # we then split the adjacency matrix along the batch dimension to get two adjacency matrices of shape B x K x N x N
-                adj1, adj2 = torch.split(adj, args.batch_size, dim=0)
-                # we do the same for the node embeddings
-                node_embeddings = node_embeddings.reshape(2*args.batch_size, args.K, net_config_gfn['max_nodes'], net_config_gfn['node_embedding_dim'])
-                node_embeddings1, node_embeddings2 = torch.split(node_embeddings, args.batch_size, dim=0)
-                # we then compute the contrastive loss
-
-
-                contrastive_loss = scorer._contrastive_loss(adj1, adj2, node_embeddings1, node_embeddings2, labels, args.device) # no reduction
-                # perform optimization step for the scorer
-                optimizer_scorer.zero_grad()
-                r_contrastive_loss = contrastive_loss.mean()
-                r_contrastive_loss.backward()
-                metrics_dict = {}
-                gradient_clipping_and_metrics(scorer, metrics_dict, 'scorer_')
-                metrics_dict['train/scorer_loss'] = r_contrastive_loss.item()
-                optimizer_scorer.step()
-
-                if step == 0:
-                    step += 1
-                    last_fwd_transition_probs = fwd_transition_probs
-                    last_flow = flow
-                    last_contrastive_loss = contrastive_loss
-                    continue
                 step += 1
 
-                # now we compute the gfn loss as (log F(s) + log Pf(s'|s) - log F(s') - log Pb(s|s') + E(s-->s') )^2
-                # where F(s) is the flow computed by the gfn, Pf(s'|s) is the forward transition probability
-                # Pb(s|s') is the backward transition probability and E(s-->s') is the difference in energy between the two states
-                # energy here is just the difference in contrastive loss between the two states
-                dE = contrastive_loss - last_contrastive_loss # B, 1
-                if args.log_flow:
-                    gfn_loss = (last_flow + torch.log(last_fwd_transition_probs) - flow - torch.log(bck_transition_probs) + dE)**2
-                else:
-                    gfn_loss = (torch.log(last_flow) + torch.log(last_fwd_transition_probs) - torch.log(flow) - torch.log(bck_transition_probs) + dE)**2
-                gfn_loss = gfn_loss.mean()
-                optimizer_gflownet.zero_grad()
-                gfn_loss.backward()
-                gradient_clipping_and_metrics(gflownet, metrics_dict, 'gflownet_')
-                metrics_dict['train/gflownet_loss'] = gfn_loss.item()
-                optimizer_gflownet.step()            
+                metrics_dict = {}
+                node_ebd1, node_ebd2 = node_embeddings[:args.batch_size*args.K], node_embeddings[args.batch_size*args.K:]
+                adj1, adj2 = adj[:args.batch_size*args.K], adj[args.batch_size*args.K:]
+                adj_new, nd_ebd_new, stop, comb_loss, cont_loss, gfn_loss, dE = contrastGFN.train_step(obs1, obs2, adj1, adj2, node_ebd1, node_ebd2, labels)
+                
+                # update the done flag 
+                done = done + stop
 
+                optimizer.zero_grad()
+                comb_loss.mean().backward(retain_graph=False)
+                gradient_clipping_and_metrics(contrastGFN, metrics_dict, 'ccGFN')
+                metrics_dict['train/gflownet_loss'] = gfn_loss.item()
+                metrics_dict['train/contrast_loss'] = cont_loss.item()
+                metrics_dict['train/combined_loss'] = comb_loss.mean().item()
+                optimizer.step()
+
+                adj1, adj2 = adj_new[:args.batch_size*args.K], adj_new[args.batch_size*args.K:]
+                node_ebd1, node_ebd2 = nd_ebd_new[:args.batch_size*args.K], nd_ebd_new[args.batch_size*args.K:]
+                print("step: ", step, "number done: ", done.sum())
+                print("losses ", comb_loss.mean().item(), cont_loss.item(), gfn_loss.item(), dE.item())
+                if step == MAX_STEPS:
+                    break
             for key, val in metrics_dict.items():
                 if args.write_to_tensorboard:
                     writer.add_scalar(key, val, n_samples)

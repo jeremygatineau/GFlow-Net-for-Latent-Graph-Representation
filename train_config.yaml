@@ -1,7 +1,7 @@
 defaults:
   - override hydra/launcher: submitit_local
-
-dataset: contrastive_dataset_10_80.pkl
+num_workers: 4
+dataset_name: contrastive_dataset_10_80.pkl
 experiment: test
 path: ${oc.env:PROCESSED_TRAIN_NO_TL}
 num_files: 1000
@@ -9,16 +9,17 @@ n_cpus: 4
 lr: 3e-4
 samples_per_epoch: 5000
 max_visible_road_points: 500
-batch_size: 512
+batch_size: 16
 epochs: 700
-device: cuda
+device: cpu
 n_stacked_states: 5
 view_dist: 80
 view_angle: 3.14
 actions_are_positions: False
 discrete: True
 seed: 0
-
+K: 3
+log_flow: True
 # WANDB things
 wandb: True
 wandb_project: nocturne

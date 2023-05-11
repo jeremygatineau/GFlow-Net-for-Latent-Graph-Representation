@@ -1,0 +1,5 @@
+Project for CS 6804 Machihne Learning on graphs. To start training just run the train.py file.
+
+gfn.py contrains most of the new code. 
+Somefiles and functions have been exised from other glflownet implemntations as well as from the nocturne example files in order to load and create the dataset from expert data from the Wamo Dataset.
+
